@@ -1,0 +1,21 @@
+# Pipeline CI seul : déclenché sur chaque Pull Request vers main.
+# Il teste et vérifie que l'image se construit, sans rien déployer.
+steps:
+  - id: tests
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q -r requirements-dev.txt
+        flake8 app tests --max-line-length=100
+        pytest -v
+
+  - id: build-check
+    name: gcr.io/cloud-builders/docker
+    args: [build, -t, pr-check:$SHORT_SHA, .]
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 600s

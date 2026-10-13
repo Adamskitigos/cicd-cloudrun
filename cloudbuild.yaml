@@ -1,0 +1,88 @@
+# Pipeline CI/CD principal : déclenché à chaque push sur main.
+# Étapes : lint -> tests -> build -> push -> deploy -> smoke test
+substitutions:
+  _REGION: europe-west1
+  _SERVICE: cicd-demo
+  _REPO: cicd-repo
+  _RUNTIME_SA: cicd-runtime
+
+steps:
+  # 1. Lint + tests unitaires (un échec ici bloque tout le déploiement)
+  - id: tests
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q -r requirements-dev.txt
+        flake8 app tests --max-line-length=100
+        pytest -v
+
+  # 2. Build de l'image, taguée avec le hash du commit (versioning)
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+      - .
+    waitFor: [tests]
+
+  # 3. Push vers Artifact Registry
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: [push, --all-tags, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}"]
+
+  # 4. Déploiement sur Cloud Run (nouvelle révision + tag d'URL par commit)
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --service-account=${_RUNTIME_SA}@$PROJECT_ID.iam.gserviceaccount.com
+      - --allow-unauthenticated
+      - --min-instances=0
+      - --max-instances=2
+      - --memory=256Mi
+      - --cpu=1
+      - --set-env-vars=COMMIT_SHA=$SHORT_SHA
+      - --tag=c-$SHORT_SHA
+      - --labels=commit=$SHORT_SHA,managed-by=cloud-build
+
+  # 5. Smoke test : vérifie que la nouvelle version répond, sinon rollback auto
+  - id: smoke-test
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        URL=$(gcloud run services describe ${_SERVICE} --region=${_REGION} --format='value(status.url)')
+        echo "Service URL: $$URL"
+        for i in 1 2 3 4 5; do
+          if curl -fsS "$$URL/health"; then
+            echo; echo "Smoke test OK"; exit 0
+          fi
+          echo "Tentative $$i échouée, nouvel essai dans 5s..."; sleep 5
+        done
+        echo "Smoke test KO -> rollback vers la révision précédente"
+        PREV=$(gcloud run revisions list --service=${_SERVICE} --region=${_REGION} \
+               --sort-by=~metadata.creationTimestamp --format='value(metadata.name)' --limit=2 | tail -n1)
+        gcloud run services update-traffic ${_SERVICE} --region=${_REGION} --to-revisions=$$PREV=100
+        exit 1
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_MEDIUM
+
+timeout: 900s
